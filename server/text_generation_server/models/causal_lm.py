@@ -15,6 +15,7 @@ from contextlib import nullcontext
 from optimum.habana.utils import HabanaProfile
 
 from optimum.habana.transformers.generation import MODELS_OPTIMIZED_WITH_STATIC_SHAPES
+from optimum.habana.utils import get_hpu_memory_stats
 from optimum.habana.checkpoint_utils import (
     get_repo_root,
     model_on_meta,
@@ -39,9 +40,10 @@ BATCH_BUCKET_SIZE = int(os.environ.get('BATCH_BUCKET_SIZE', 8))
 PREFILL_BATCH_BUCKET_SIZE = int(os.environ.get('PREFILL_BATCH_BUCKET_SIZE', 4))
 TRACE_FILENAME = os.environ.get('TRACE_FILENAME')
 
+
 def trace(txt):
-    if TRACE_FILENAME is not None:
-        print(txt, flush=True, file=open(TRACE_FILENAME, 'a'))
+    if TRACE_FILENAME is not None and torch.distributed.get_rank() == 0:
+        print(f"{txt}: {get_hpu_memory_stats()}", flush=True, file=open(TRACE_FILENAME, 'a'))
 
 
 def round_up(number, k):
@@ -123,6 +125,7 @@ class CausalLMRequest:
         prev = self.idx
         self.idx = new_idx
         return (new_idx, prev)
+
 
 @dataclass
 class CausalLMBatch(Batch):
@@ -242,6 +245,7 @@ class CausalLMBatch(Batch):
         )
 
         htorch.core.mark_step()
+        trace("RECOMBINE stop")
 
         return cls(
             batch_id=batch_id,
@@ -257,7 +261,6 @@ class CausalLMBatch(Batch):
             input_length=input_length,
             right_padding=right_padding
         )
-
 
     @classmethod
     def from_pb(
@@ -590,6 +593,7 @@ class CausalLM(Model):
         next_token_logprobs = next_token_logprobs.tolist()
         next_token_ids_cpu = next_token_ids.cpu()
         htorch.core.mark_step()
+        trace("GENERATE finish token selection")
 
         for req in batch.requests:
             i = req.idx
@@ -694,6 +698,7 @@ class CausalLM(Model):
             req.read_offset = read_offset
             htorch.core.mark_step()
 
+        trace("GENERATE finish token generation")
         if token_idx is None:
             batch.input_ids[:, 0] = next_token_ids[:, 0]
         else:
@@ -730,5 +735,6 @@ class CausalLM(Model):
         if self.hb_profer_started == True:
             self.hb_profer.step()
         htorch.core.mark_step()
+        trace("GENERATE end")
 
         return generations, batch
