@@ -3,6 +3,7 @@ import tempfile
 import itertools
 import time
 import glob
+import bisect
 
 from text_generation_server.utils.tokens import batch_top_tokens
 import torch
@@ -44,6 +45,7 @@ if 'GRAPH_VISUALIZATION' in os.environ:
         os.remove(f)
 
 BATCH_BUCKET_SIZE = int(os.environ.get('BATCH_BUCKET_SIZE', 8))
+PAD_SEQUENCE_TO_MULTIPLE_OF = int(os.environ.get('PAD_SEQUENCE_TO_MULTIPLE_OF', 256))
 PREFILL_BATCH_BUCKET_SIZE = int(os.environ.get('PREFILL_BATCH_BUCKET_SIZE', 4))
 DBG_TRACE_FILENAME = os.environ.get('DBG_TRACE_FILENAME')
 START_TS = None
@@ -234,7 +236,7 @@ class CausalLMBatch(Batch):
 
         inplace = batches[target_batch_idx].batch_size == new_bs
         dbg_trace(
-            scenario, f'bs:{[b.batch_size for b in batches]}->{new_bs} reqs:{[len(b) for b in batches]} offsets:{offsets} padding:{padding} moves_needed:{moves_needed} inplace:{inplace}')
+            scenario, f'bs, seq_len:{[f"{b.batch_size},{b.seq_length}" for b in batches]}->{new_bs} reqs:{[len(b) for b in batches]} offsets:{offsets} padding:{padding} moves_needed:{moves_needed} inplace:{inplace}')
 
         grouped_requests = [[req for req in batch.requests] for batch in batches]
         flat_requests = list(itertools.chain(*grouped_requests))
@@ -376,16 +378,31 @@ class CausalLMBatch(Batch):
         tokenized_inputs = tokenizer(
             [r.data.inputs for r in requests] + dummy_inputs,
             return_tensors="pt",
-            padding="max_length",
+            padding="longest",
             return_token_type_ids=False,
             truncation=True,
             max_length=max_input_length,
         )
 
         input_len = tokenized_inputs["input_ids"].shape[1]
+        dbg_trace("FROM_PB after tokenizer", f"input_len: {input_len}")
+
+        bucket_size = max_input_length
+        left_padding = 0
+        if PAD_SEQUENCE_TO_MULTIPLE_OF != 0 and input_len < max_input_length:
+            assert max_input_length // PAD_SEQUENCE_TO_MULTIPLE_OF > 1, f"PAD_SEQUENCE_TO_MULTIPLE_OF ({PAD_SEQUENCE_TO_MULTIPLE_OF}) is too high, because max input length is: {max_input_length}, so there is no point to divide sequences into buckets."
+            buckets = list(range(PAD_SEQUENCE_TO_MULTIPLE_OF, max_input_length + 1, PAD_SEQUENCE_TO_MULTIPLE_OF))
+            # dbg_trace("FROM_PB", f"buckets: {buckets}")
+            bucket_idx = bisect.bisect(buckets, input_len)
+            bucket_size = buckets[bucket_idx]
+            dbg_trace("FROM_PB", f"bucket size: {bucket_size}")
+            left_padding = bucket_size - 1 - input_len
+            # New input len after left padding to selected bucket
+            input_len = bucket_size - 1
+
         extra_padding = 0
         if is_optimized_for_gaudi and max_total_tokens > 0:
-            extra_padding = max(extra_padding, max_total_tokens - max_input_length - max_new_tokens)
+            extra_padding = max(extra_padding, max_total_tokens - bucket_size - max_new_tokens)
 
         for r in requests:
             r.input_length = input_len
@@ -398,17 +415,20 @@ class CausalLMBatch(Batch):
         if is_optimized_for_gaudi:
             # Allocate space for first token
             input_ids = torch.nn.functional.pad(
-                input_ids, (0, 1), value=tokenizer.pad_token_id
+                input_ids, (left_padding, 1), value=tokenizer.pad_token_id
             )
             attention_mask = torch.nn.functional.pad(
-                attention_mask, (0, 1), value=0
+                attention_mask, (left_padding, 1), value=0
             )
             all_input_ids = torch.nn.functional.pad(
-                input_ids, (0, max_new_tokens + extra_padding - 1), value=tokenizer.pad_token_id
+                input_ids, (0, max_new_tokens + extra_padding), value=tokenizer.pad_token_id
             ).T.split(1, dim=1)
         else:
             all_input_ids = input_ids.clone().T.split(1, dim=1)
 
+        dbg_trace("FROM_PB", f"input_ids shape: {input_ids.shape}")
+        dbg_trace("FROM_PB", f"all_input_ids : {all_input_ids}")
+        dbg_trace("FROM_PB", f"all_input_ids[0] shape: {all_input_ids[0].shape}")
         for r in requests:
             r.all_input_ids = all_input_ids[r.idx]
 
@@ -429,7 +449,7 @@ class CausalLMBatch(Batch):
             next_token_chooser=next_token_chooser,
             top_n_tokens=top_n_tokens,
             top_n_tokens_tensor=top_n_tokens_tensor,
-            input_length=max_input_length,
+            input_length=input_len,
             right_padding=max_new_tokens + extra_padding if is_optimized_for_gaudi else 0
         )
 
