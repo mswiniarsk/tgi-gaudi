@@ -236,7 +236,7 @@ class CausalLMBatch(Batch):
 
         inplace = batches[target_batch_idx].batch_size == new_bs
         dbg_trace(
-            scenario, f'bs, seq_len:{[f"{b.batch_size},{b.seq_length}" for b in batches]}->{new_bs} reqs:{[len(b) for b in batches]} offsets:{offsets} padding:{padding} moves_needed:{moves_needed} inplace:{inplace}')
+            scenario, f'bs:{[b.batch_size for b in batches]}->{new_bs} reqs:{[len(b) for b in batches]} offsets:{offsets} padding:{padding} moves_needed:{moves_needed} inplace:{inplace}')
 
         grouped_requests = [[req for req in batch.requests] for batch in batches]
         flat_requests = list(itertools.chain(*grouped_requests))
@@ -385,29 +385,19 @@ class CausalLMBatch(Batch):
         )
 
         input_len = tokenized_inputs["input_ids"].shape[1]
-        dbg_trace("FROM_PB after tokenizer", f"input_len: {input_len}")
 
         bucket_size = max_input_length
-        left_padding = 0
-        if PAD_SEQUENCE_TO_MULTIPLE_OF != 0 and input_len < max_input_length:
-            assert max_input_length // PAD_SEQUENCE_TO_MULTIPLE_OF > 1, f"PAD_SEQUENCE_TO_MULTIPLE_OF ({PAD_SEQUENCE_TO_MULTIPLE_OF}) is too high, because max input length is: {max_input_length}, so there is no point to divide sequences into buckets."
+        left_padding = max_input_length - input_len
+        if input_len < max_input_length and PAD_SEQUENCE_TO_MULTIPLE_OF != 0:
+            assert PAD_SEQUENCE_TO_MULTIPLE_OF <= max_input_length, "PAD_SEQUENCE_TO_MULTIPLE_OF cannot be higher than max_input_length"
             buckets = list(range(PAD_SEQUENCE_TO_MULTIPLE_OF, max_input_length + 1, PAD_SEQUENCE_TO_MULTIPLE_OF))
-            # dbg_trace("FROM_PB", f"buckets: {buckets}")
             bucket_idx = bisect.bisect(buckets, input_len)
-            bucket_size = buckets[bucket_idx]
-            dbg_trace("FROM_PB", f"bucket size: {bucket_size}")
-            left_padding = bucket_size - 1 - input_len
-            # New input len after left padding to selected bucket
-            input_len = bucket_size - 1
+            bucket_size = buckets[bucket_idx] - 1
+            left_padding = bucket_size - input_len
 
         extra_padding = 0
         if is_optimized_for_gaudi and max_total_tokens > 0:
-            extra_padding = max(extra_padding, max_total_tokens - bucket_size - max_new_tokens)
-
-        for r in requests:
-            r.input_length = input_len
-            r.prefix_offset = input_len - 5
-            r.read_offset = input_len
+            extra_padding = max(extra_padding, max_total_tokens - (bucket_size + 1) - max_new_tokens)
 
         input_ids = tokenized_inputs["input_ids"]
         attention_mask = tokenized_inputs["attention_mask"]
@@ -426,10 +416,12 @@ class CausalLMBatch(Batch):
         else:
             all_input_ids = input_ids.clone().T.split(1, dim=1)
 
-        dbg_trace("FROM_PB", f"input_ids shape: {input_ids.shape}")
-        dbg_trace("FROM_PB", f"all_input_ids : {all_input_ids}")
-        dbg_trace("FROM_PB", f"all_input_ids[0] shape: {all_input_ids[0].shape}")
+        # New input length after left padding
+        input_len = bucket_size
         for r in requests:
+            r.input_length = input_len
+            r.prefix_offset = input_len - 5
+            r.read_offset = input_len
             r.all_input_ids = all_input_ids[r.idx]
 
         input_ids = input_ids.to(device)
