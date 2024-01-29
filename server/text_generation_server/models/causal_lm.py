@@ -3,7 +3,6 @@ import tempfile
 import itertools
 import time
 import glob
-import bisect
 
 from text_generation_server.utils.tokens import batch_top_tokens
 import torch
@@ -390,9 +389,7 @@ class CausalLMBatch(Batch):
         left_padding = max_input_length - input_len
         if input_len < max_input_length and PAD_SEQUENCE_TO_MULTIPLE_OF != 0:
             assert PAD_SEQUENCE_TO_MULTIPLE_OF <= max_input_length, "PAD_SEQUENCE_TO_MULTIPLE_OF cannot be higher than max_input_length"
-            buckets = list(range(PAD_SEQUENCE_TO_MULTIPLE_OF, max_input_length + 1, PAD_SEQUENCE_TO_MULTIPLE_OF))
-            bucket_idx = bisect.bisect(buckets, input_len)
-            bucket_size = buckets[bucket_idx] - 1
+            bucket_size = round_up(input_len + 1, PAD_SEQUENCE_TO_MULTIPLE_OF) - 1
             left_padding = bucket_size - input_len
 
         extra_padding = 0
