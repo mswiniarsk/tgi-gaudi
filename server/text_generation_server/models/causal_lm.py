@@ -78,6 +78,13 @@ def to_tensor_indices(indices, device):
     return [torch.tensor(idx, dtype=torch.int32, device=device) for idx in indices]
 
 
+def hpu_graph(fn):
+    class FnModule(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return fn(*args, **kwargs)
+    return wrap_in_hpu_graph(FnModule(), disable_tensor_cache=True)
+
+
 def calculate_chunks(offset):
     chunk_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
     result = []
@@ -98,7 +105,6 @@ def grouped_pad(tensor_groups, dims, values):
             for i in range(len(tensors)):
                 tensors[i] = torch.nn.functional.pad(tensors[i], pad_shape, value=value)
     htorch.core.mark_step()
-    return tensor_groups
 
 
 def grouped_shift(tensor_groups, dims, offset):
@@ -111,7 +117,14 @@ def grouped_shift(tensor_groups, dims, offset):
             for i in range(len(tensors)):
                 tensors[i] = torch.roll(tensors[i], c, dim)
         htorch.core.mark_step()
-    return tensor_groups
+
+
+@hpu_graph
+def move(dst_tensors, dst_dim, dst_indices, src_tensors, src_dim, src_indices):
+    for dst_t, src_t in zip(dst_tensors, src_tensors):
+        for dst_idx, src_idx in zip(dst_indices, src_indices):
+            dst_t.index_copy_(dst_dim, dst_idx, torch.index_select(src_t, src_dim, src_idx))
+    htorch.core.mark_step()
 
 
 def grouped_move(dst_tensor_groups, dst_dims, dst_indices, src_tensor_groups, src_dims, src_indices):
@@ -127,11 +140,26 @@ def grouped_move(dst_tensor_groups, dst_dims, dst_indices, src_tensor_groups, sr
         else:
             # Other cases don't need special support
             pass
-        for dst_t, src_t in zip(dst_tensors, src_tensors):
-            for dst_idx, src_idx in zip(dst_indices, src_indices):
-                dst_t.index_copy_(dst_dim, dst_idx, torch.index_select(src_t, src_dim, src_idx))
-        htorch.core.mark_step()
-    return dst_tensor_groups
+        move(dst_tensors, dst_dim, dst_indices, src_tensors, src_dim, src_indices)
+
+
+# @hpu_graph
+# def grouped_move(dst_tensor_groups, dst_dims, dst_indices, src_tensor_groups, src_dims, src_indices):
+#    for dst_tensors, dst_dim, src_tensors, src_dim in zip(dst_tensor_groups, dst_dims, src_tensor_groups, src_dims):
+#        if dst_dim == 1 and src_dim == 0:
+#            # Case 1: Only destination is merged
+#            dst_tensors = dst_tensors[0]
+#            dst_dim = 0
+#        elif dst_dim == 0 and src_dim == 1:
+#            # Case 2: Only source is merged
+#            src_tensors = src_tensors[0]
+#            src_dim = 0
+#        else:
+#            # Other cases don't need special support
+#            pass
+#        for dst_t, src_t in zip(dst_tensors, src_tensors):
+#            for dst_idx, src_idx in zip(dst_indices, src_indices):
+#                dst_t.index_copy_(dst_dim, dst_idx, torch.index_select(src_t, src_dim, src_idx))
 
 
 def grouped_extend_batch(tensor_groups, target_bs, bs_dims):
@@ -151,7 +179,6 @@ def grouped_extend_batch(tensor_groups, target_bs, bs_dims):
                     else:
                         tensors[i][:, batch_idx] = prev[:, batch_idx]
     htorch.core.mark_step()
-    return tensor_groups
 
 
 def remove_kv_cache_from_output(module):
@@ -173,15 +200,6 @@ def remove_kv_cache_from_output(module):
 
     module.forward = forward
     return module
-
-
-def pad_tensors(tensors, paddings, dim, value):
-    for i, (tensor, padding) in enumerate(zip(tensors, paddings)):
-        if padding > 0:
-            pad_shape = (0, 0, 0, padding) if dim == -2 else (0, padding)
-            tensors[i] = torch.nn.functional.pad(tensor, pad_shape, value=value)
-            htorch.core.mark_step()
-    return tensors
 
 
 @dataclass
@@ -295,13 +313,13 @@ class CausalLMBatch(Batch):
 
     def realign(self, target_bs, offset, pad_token_id):
         tensors, seq_dims, _ = self.get_tensor_groups()
-        tensors = grouped_pad(tensors, seq_dims, [pad_token_id, 0, 0, 0, 0])
-        tensors = grouped_shift(tensors, seq_dims, offset)
+        grouped_pad(tensors, seq_dims, [pad_token_id, 0, 0, 0, 0])
+        grouped_shift(tensors, seq_dims, offset)
         self.set_tensor_groups(tensors)
 
     def expand_bs(self, target_bs):
         tensors, _, bs_dims = self.get_tensor_groups()
-        tensors = grouped_extend_batch(tensors, target_bs, bs_dims)
+        grouped_extend_batch(tensors, target_bs, bs_dims)
         self.set_tensor_groups(tensors)
 
     def used_indices(self):
@@ -323,7 +341,7 @@ class CausalLMBatch(Batch):
             src_indices = to_tensor_indices(src_b.used_indices(), self.input_ids.device)
             dst_indices = to_tensor_indices(src_b.update_indices(free_indices_gen), self.input_ids.device)
             src_tensors, _, src_dims = src_b.get_tensor_groups()
-            dst_tensors = grouped_move(dst_tensors, dst_dims, dst_indices, src_tensors, src_dims, src_indices)
+            grouped_move(dst_tensors, dst_dims, dst_indices, src_tensors, src_dims, src_indices)
         self.set_tensor_groups(dst_tensors)
 
     @classmethod
