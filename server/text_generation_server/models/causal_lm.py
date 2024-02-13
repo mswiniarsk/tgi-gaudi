@@ -78,13 +78,6 @@ def to_tensor_indices(indices, device):
     return [torch.tensor(idx, dtype=torch.int32, device=device) for idx in indices]
 
 
-def hpu_graph(fn):
-    class FnModule(torch.nn.Module):
-        def forward(self, *args, **kwargs):
-            return fn(*args, **kwargs)
-    return wrap_in_hpu_graph(FnModule(), disable_tensor_cache=True)
-
-
 def calculate_chunks(offset):
     chunk_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
     result = []
@@ -125,7 +118,6 @@ def move(dst_tensors, dst_dim, dst_indices, src_tensors, src_dim, src_indices):
             dst_t.index_copy_(dst_dim, dst_idx, torch.index_select(src_t, src_dim, src_idx))
 
 
-@hpu_graph
 def grouped_move(dst_tensor_groups, dst_dims, dst_indices, src_tensor_groups, src_dims, src_indices):
     for dst_tensors, dst_dim, src_tensors, src_dim in zip(dst_tensor_groups, dst_dims, src_tensor_groups, src_dims):
         if dst_dim == 1 and src_dim == 0:
@@ -199,6 +191,18 @@ def remove_kv_cache_from_output(module):
 
     module.forward = forward
     return module
+
+
+def hpu_graph_fn(fn):
+    class FnModule(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return fn(*args, **kwargs)
+    return wrap_in_hpu_graph(FnModule(), disable_tensor_cache=True)
+
+
+def enable_hpu_graphs():
+    global grouped_move
+    grouped_move = hpu_graph_fn(grouped_move)
 
 
 @dataclass
@@ -644,6 +648,9 @@ class CausalLM(Model):
             if self.enable_hpu_graph:
                 model = wrap_in_hpu_graph(model, disable_tensor_cache=True)
         model = self.setup_quantization(model)
+
+        if self.enable_hpu_graph:
+            enable_hpu_graphs()
 
         if model.config.model_type in MODELS_OPTIMIZED_WITH_STATIC_SHAPES:
             self.is_optimized_for_gaudi = True
