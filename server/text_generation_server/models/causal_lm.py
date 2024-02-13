@@ -119,14 +119,13 @@ def grouped_shift(tensor_groups, dims, offset):
         htorch.core.mark_step()
 
 
-@hpu_graph
 def move(dst_tensors, dst_dim, dst_indices, src_tensors, src_dim, src_indices):
     for dst_t, src_t in zip(dst_tensors, src_tensors):
         for dst_idx, src_idx in zip(dst_indices, src_indices):
             dst_t.index_copy_(dst_dim, dst_idx, torch.index_select(src_t, src_dim, src_idx))
-    htorch.core.mark_step()
 
 
+@hpu_graph
 def grouped_move(dst_tensor_groups, dst_dims, dst_indices, src_tensor_groups, src_dims, src_indices):
     for dst_tensors, dst_dim, src_tensors, src_dim in zip(dst_tensor_groups, dst_dims, src_tensor_groups, src_dims):
         if dst_dim == 1 and src_dim == 0:
