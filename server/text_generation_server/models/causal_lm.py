@@ -67,6 +67,14 @@ def calculate_chunks(offset):
     return result
 
 
+def calculate_min_chunks(offset):
+    # We can explot the fact the we're rolling everything modulo MAX_TOTAL_TOKENS
+    # This means that shift right by N tokens is the same as shift left by (MAX_TOTAL_TOKENS - N)
+    lhs = calculate_chunks(offset)
+    rhs = calculate_chunks(-(MAX_TOTAL_TOKENS-offset))
+    return min(lhs, rhs, key=lambda c: len(c))
+
+
 def biggest_single_chunk(offset):
     if offset != 0:
         idx = bisect.bisect(CHUNK_SIZES, abs(offset))
@@ -107,7 +115,7 @@ def grouped_roll(tensor_groups, chunk, dims, merge_graphs):
 
 
 def grouped_shift(tensor_groups, dims, offset, merge_graphs):
-    chunks = calculate_chunks(offset)
+    chunks = calculate_min_chunks(offset)
     for c in chunks:
         tensor_groups = grouped_roll(tensor_groups, c, dims, merge_graphs)
     return tensor_groups
